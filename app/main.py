@@ -3,6 +3,7 @@ load_dotenv()
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from app.api.webhook import router as webhook_router
@@ -15,6 +16,18 @@ app = FastAPI(
     title="AutoReviewer",
     description="Autonomous GitHub code review agent",
     version="0.1.0"
+)
+
+# CORS — allow frontend origins to call this API from the browser
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://revuops-web.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.state.limiter = limiter
