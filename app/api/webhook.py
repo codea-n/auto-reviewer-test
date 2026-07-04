@@ -9,32 +9,40 @@ from app.agents.graph import review_graph
 from app.api.github_client import post_pr_comment
 from app.db.repository import save_review
 from app.db.supabase_client import get_client
+from app.api.email import send_review_email
+
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _lookup_user_id(installation_id: int) -> str | None:
+def _lookup_user(installation_id: int) -> dict:
     """
-    Given a GitHub App installation_id, find which user installed it.
-    Returns their Supabase user_id, or None if not found.
-    Why: every webhook GitHub sends includes installation_id — this is
-    how we link a PR review back to the user who owns that repo.
+    Given installation_id, returns user_id and email.
+    Queries installations table then auth.users for email.
     """
     if not installation_id:
-        return None
+        return {}
     try:
         client = get_client()
+        # Get user_id from installations
         res = client.table("installations")\
             .select("user_id")\
             .eq("installation_id", installation_id)\
             .limit(1)\
             .execute()
-        if res.data:
-            return res.data[0]["user_id"]
+        if not res.data:
+            return {}
+        user_id = res.data[0]["user_id"]
+
+        # Get email from auth.users using admin client
+        user_res = client.auth.admin.get_user_by_id(user_id)
+        email = user_res.user.email if user_res.user else None
+
+        return {"user_id": user_id, "email": email}
     except Exception as e:
         logger.warning(f"Could not look up user for installation {installation_id}: {e}")
-    return None
+    return {}
 
 
 async def _fetch_diff(diff_url: str) -> str:
@@ -92,6 +100,16 @@ async def _run_review(pr_info: dict):
             pr_number      = pr_info["pr_number"],
             body           = comment_body,
         )
+        author_email = pr_info.get("author_email")
+        if author_email:
+            send_review_email(
+                to_email=author_email,
+                repo=pr_info["repo"],
+                pr_number=pr_info["pr_number"],
+                verdict=result.get("final_review", ""),
+                review_id=review_id,
+            )
+
         logger.info(f"Review {review_id} posted to PR #{pr_info['pr_number']}")
 
     except Exception as e:
@@ -119,7 +137,10 @@ async def github_webhook(
         # Extract installation_id GitHub sends with every webhook
         installation_id = body.get("installation", {}).get("id")
         # Look up which user owns this installation
-        user_id = _lookup_user_id(installation_id)
+        user_info = _lookup_user(installation_id)
+        user_id = user_info.get("user_id")
+        author_email = user_info.get("email")
+
         logger.info(f"Webhook: installation_id={installation_id}, user_id={user_id}")
 
         pr_info = {
@@ -131,6 +152,8 @@ async def github_webhook(
             "head_branch": pr["head"]["ref"],
             "diff_url":    pr["diff_url"],
             "user_id":     user_id,               # ← new
+            "author_email": author_email,   # ← new
+
         }
 
         background_tasks.add_task(_run_review, pr_info)
