@@ -141,7 +141,7 @@ async def github_webhook(
         user_id = user_info.get("user_id")
         author_email = user_info.get("email")
 
-        logger.info(f"Webhook: installation_id={installation_id}, user_id={user_id}")
+        logger.info(f"Webhook: installation_id={installation_id}, user_id={user_id}, email={author_email}")
 
         pr_info = {
             "pr_number":   pr["number"],
