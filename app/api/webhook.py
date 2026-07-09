@@ -10,6 +10,7 @@ from app.api.github_client import post_pr_comment
 from app.db.repository import save_review
 from app.db.supabase_client import get_client
 from app.api.email import send_review_email
+from app.api.security import limiter
 
 
 router = APIRouter()
@@ -119,6 +120,7 @@ async def _run_review(pr_info: dict):
 
 
 @router.post("/webhook")                          # ← fixed: was /webhook/github
+@limiter.limit("60/minute")
 async def github_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
