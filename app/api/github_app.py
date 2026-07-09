@@ -34,7 +34,6 @@ _jwks_client: PyJWKClient = _make_jwks_client()
 async def verify_supabase_token(request: Request) -> str:
     """
     Verifies a Supabase JWT using ES256 via JWKS.
-
     Security decisions:
     - PyJWKClient handles kid-based key selection and rotation automatically.
     - get_signing_key_from_jwt() uses blocking urllib internally.
@@ -49,19 +48,15 @@ async def verify_supabase_token(request: Request) -> str:
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing auth token")
-
     token = auth_header.replace("Bearer ", "")
-
     issuer = os.getenv("SUPABASE_ISSUER")
     if not issuer:
         raise HTTPException(status_code=500, detail="SUPABASE_ISSUER not configured")
-
     try:
         # Offload blocking urllib call to thread pool
         signing_key = await asyncio.to_thread(
             _jwks_client.get_signing_key_from_jwt, token
         )
-
         payload = pyjwt.decode(
             token,
             signing_key.key,
@@ -75,13 +70,10 @@ async def verify_supabase_token(request: Request) -> str:
                 "verify_aud": True,
             },
         )
-
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing sub claim")
-
         return user_id
-
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except pyjwt.InvalidAudienceError:
@@ -103,17 +95,14 @@ async def verify_supabase_token(request: Request) -> str:
 def _generate_jwt() -> str:
     app_id = os.getenv("GITHUB_APP_ID")
     private_key = os.getenv("GITHUB_APP_PRIVATE_KEY")
-
     if not private_key:
         pem_path = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
         if not pem_path:
             raise ValueError("Either GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH must be set")
         with open(pem_path, "r") as f:
             private_key = f.read()
-
     if not app_id:
         raise ValueError("GITHUB_APP_ID must be set")
-
     now = int(time.time())
     payload = {
         "iat": now - 60,
@@ -135,9 +124,7 @@ async def get_installation_repos(installation_id: int) -> list[dict]:
         )
         if token_resp.status_code != 201:
             raise HTTPException(status_code=400, detail="Failed to get installation token")
-
         installation_token = token_resp.json()["token"]
-
         repos_resp = await client.get(
             "https://api.github.com/installation/repositories",
             headers={
@@ -147,7 +134,6 @@ async def get_installation_repos(installation_id: int) -> list[dict]:
         )
         if repos_resp.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to fetch repositories")
-
         return repos_resp.json().get("repositories", [])
 
 
@@ -166,29 +152,67 @@ async def handle_installation(
 ):
     supabase = get_client()
 
+    # Upsert the installation record itself. on_conflict="installation_id"
+    # is required because GitHub sends the same installation_id every time
+    # a repo is added/removed under an existing install — without this,
+    # Postgres tries a plain INSERT and hits the unique constraint.
     supabase.table("installations").upsert(
         {
-        "user_id": user_id,
-        "installation_id": body.installation_id,
-        "account_login": body.account_login,
-        },
-        on_conflict="installation_id",
-        ).execute()
-
-    repos = await get_installation_repos(body.installation_id)
-
-    for repo in repos:
-        supabase.table("repositories").upsert({
             "user_id": user_id,
             "installation_id": body.installation_id,
-            "repo_full_name": repo["full_name"],
-            "repo_id": repo["id"],
+            "account_login": body.account_login,
         },
-        on_conflict="repo_id",
+        on_conflict="installation_id",
+    ).execute()
+
+    # Fetch the CURRENT set of repos GitHub says this installation has access to.
+    # This is the source of truth — our DB must converge to match it exactly.
+    repos = await get_installation_repos(body.installation_id)
+    current_repo_ids = [repo["id"] for repo in repos]
+
+    # Bulk upsert all currently-installed repos in a single request instead of
+    # looping — one network call, and no risk of a partial write if repo N
+    # in a loop were to fail after N-1 already succeeded.
+    #
+    # on_conflict="installation_id,repo_id" matches the composite UNIQUE
+    # constraint we just added. This is the correct key because a single
+    # installation can cover many repos (installation_id repeats), and the
+    # same repo_id should never collide across two different installations'
+    # rows — each (installation, repo) pair is its own identity.
+    if repos:
+        rows = [
+            {
+                "user_id": user_id,
+                "installation_id": body.installation_id,
+                "repo_full_name": repo["full_name"],
+                "repo_id": repo["id"],
+            }
+            for repo in repos
+        ]
+        supabase.table("repositories").upsert(
+            rows,
+            on_conflict="installation_id,repo_id",
         ).execute()
 
+    # Remove repos that are no longer part of this installation (e.g. user
+    # revoked access to a repo in GitHub's install settings). Without this,
+    # stale repos remain in the dashboard forever and the backend may keep
+    # attempting reviews on repos it no longer has GitHub access to.
+    #
+    # This runs AFTER the upsert above intentionally: if the upsert fails
+    # partway (network blip, etc.), the worst case is stale extra rows —
+    # not accidentally deleted rows that never got re-inserted.
+    delete_query = supabase.table("repositories") \
+        .delete() \
+        .eq("installation_id", body.installation_id)
+
+    if current_repo_ids:
+        delete_query = delete_query.not_.in_("repo_id", current_repo_ids)
+
+    delete_query.execute()
+
     logger.info(
-        f"Installation {body.installation_id} stored for user {user_id} "
+        f"Installation {body.installation_id} synced for user {user_id} "
         f"with {len(repos)} repos"
     )
     return {"status": "ok", "repos_connected": len(repos)}
