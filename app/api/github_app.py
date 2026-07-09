@@ -166,11 +166,14 @@ async def handle_installation(
 ):
     supabase = get_client()
 
-    supabase.table("installations").upsert({
+    supabase.table("installations").upsert(
+        {
         "user_id": user_id,
         "installation_id": body.installation_id,
         "account_login": body.account_login,
-    }).execute()
+        },
+        on_conflict="installation_id",
+        ).execute()
 
     repos = await get_installation_repos(body.installation_id)
 
@@ -180,7 +183,9 @@ async def handle_installation(
             "installation_id": body.installation_id,
             "repo_full_name": repo["full_name"],
             "repo_id": repo["id"],
-        }).execute()
+        },
+        on_conflict="repo_id",
+        ).execute()
 
     logger.info(
         f"Installation {body.installation_id} stored for user {user_id} "
